@@ -2,9 +2,10 @@
 
 use std::ffi::{CStr, CString};
 use std::mem;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, /*c_uint, */c_void};
 use std::panic::catch_unwind;
 use std::ptr;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use super::ffi;
@@ -63,6 +64,10 @@ pub fn log(err_code: c_int, msg: &str) {
     }
 }
 
+// struct FancyThingy {
+//     b: Box<dyn Fn(&str)>,
+// }
+
 impl Connection {
     /// `feature = "trace"` Register or clear a callback function that can be
     /// used for tracing the execution of SQL statements.
@@ -88,6 +93,125 @@ impl Connection {
             },
         }
     }
+
+    /// `feature = "trace"` Register or clear a callback function that can be
+    /// used for tracing the execution of SQL statements.
+    ///
+    /// Prepared statement placeholders are replaced/logged with their assigned
+    /// values. There can only be a single tracer defined for each database
+    /// connection. Setting a new tracer clears the old one.
+    ///
+    /// The fanciness with Box is to be able to cast to *c_void, and the 'a and 'b lifetimes are to
+    /// guarantee that the closure lives as long as the Connection (this lifetime constraint isn't
+    /// necessary but it is sufficient).
+    pub fn trace_using_closure<'a,'b>(&'a mut self, trace_fn: Option<&'b Box<dyn Fn(&str)>>) where 'b: 'a {
+        unsafe extern "C" fn trace_callback(p_arg: *mut c_void, z_sql: *const c_char) {
+            let recovered_trace_fn = p_arg as *const Box<dyn Fn(&str)>;
+            let c_slice = CStr::from_ptr(z_sql).to_bytes();
+            let s = String::from_utf8_lossy(c_slice);
+//             println!("trace callback called with p_arg = {:#?}, z_sql = {:#?}, s = {:#?}", p_arg, z_sql, s);
+            // TODO: Figure out how to avoid error "error[E0277]: the type `dyn for<'r> Fn(&'r str)`
+            // may contain interior mutability and a reference may not be safely transferrable across
+            // a catch_unwind boundary"
+//             let _ = catch_unwind(move || recovered_trace_fn.as_ref().unwrap()(&s));
+            recovered_trace_fn.as_ref().unwrap()(&s);
+        }
+
+        let c = self.db.borrow_mut();
+        match trace_fn {
+            Some(f) => unsafe {
+//                 println!("trace installed a callback");
+                ffi::sqlite3_trace(c.db(), Some(trace_callback), f as *const _ as *mut c_void);
+            },
+            None => unsafe {
+//                 println!("trace uninstalled a callback");
+                ffi::sqlite3_trace(c.db(), None, ptr::null_mut());
+            },
+        }
+    }
+
+    /// `feature = "trace"` Register or clear a callback function that can be
+    /// used for tracing the execution of SQL statements.
+    ///
+    /// Prepared statement placeholders are replaced/logged with their assigned
+    /// values. There can only be a single tracer defined for each database
+    /// connection. Setting a new tracer clears the old one.
+    ///
+    /// The fanciness with Box is to be able to cast to *c_void, and the use of Arc is to
+    /// be able to check that the closure is still alive each time it's used.  This might
+    /// be slower than is necessary.
+    pub fn trace_using_closure_2(&mut self, trace_fn: Option<Arc<Box<dyn Fn(&str)>>>) {
+        unsafe extern "C" fn trace_callback(p_arg: *mut c_void, z_sql: *const c_char) {
+            let recovered_trace_fn_w = Weak::from_raw(p_arg as *const Box<dyn Fn(&str)>);
+            if let Some(recovered_trace_fn_a) = recovered_trace_fn_w.upgrade() {
+                let c_slice = CStr::from_ptr(z_sql).to_bytes();
+                let s = String::from_utf8_lossy(c_slice);
+    //             println!("trace callback called with p_arg = {:#?}, z_sql = {:#?}, s = {:#?}", p_arg, z_sql, s);
+                // TODO: Figure out how to avoid error "error[E0277]: the type `dyn for<'r> Fn(&'r str)`
+                // may contain interior mutability and a reference may not be safely transferrable across
+                // a catch_unwind boundary"
+    //             let _ = catch_unwind(move || recovered_trace_fn_a(&s));
+                recovered_trace_fn_a(&s);
+            } else {
+                panic!("trace_fn was deallocated");
+            }
+            // From what I read of the docs, this is necessary so that each call to Weak::from_raw
+            // is paired with exactly one call to into_raw.
+            recovered_trace_fn_w.into_raw();
+        }
+
+        let c = self.db.borrow_mut();
+        match trace_fn {
+            Some(f) => unsafe {
+//                 println!("trace installed a callback");
+                ffi::sqlite3_trace(c.db(), Some(trace_callback), Arc::downgrade(&f).as_ptr() as *mut c_void);
+            },
+            None => unsafe {
+//                 println!("trace uninstalled a callback");
+                ffi::sqlite3_trace(c.db(), None, ptr::null_mut());
+            },
+        }
+    }
+
+//     /// `feature = "trace"` Register or clear a callback function that can be
+//     /// used for tracing the execution of SQL statements.
+//     ///
+//     /// Prepared statement placeholders are replaced/logged with their assigned
+//     /// values. There can only be a single tracer defined for each database
+//     /// connection. Setting a new tracer clears the old one.
+//     ///
+//     /// TODO: Add mask and data pointer
+//     /// See https://www.sqlite.org/c3ref/trace_v2.html and https://www.sqlite.org/c3ref/c_trace.html
+// //     pub fn trace_v2(&mut self, trace_fn: Option<Box<FancyThingy>>) {
+//     // NOTE that `'b: 'a` means that 'b must outlive 'a.
+//     pub fn trace_v2<'a,'b>(&'a mut self, trace_fn: Option<&'b Box<dyn Fn(&str)>>) where 'b: 'a {
+//         // This is the actual callback passed into sqlite3_trace_v2.  It acts as the glue layer
+//         unsafe extern "C" fn trace_callback(_mask: c_uint, _c: *mut c_void, p_arg: *mut c_void, z_sql: *mut c_void) -> c_int {
+// //             println!("HIPPO HIPPO");
+// //             let recovered_trace_fn = Box::<dyn Fn(&str)>::from_raw(mem::transmute::<_,*mut dyn Fn(&str)>(p_arg));
+//             let recovered_trace_fn = p_arg as *const Box<dyn Fn(&str)>;
+//             let c_slice = CStr::from_ptr(z_sql as *const c_char).to_bytes();
+//             let s = String::from_utf8_lossy(c_slice);
+// //             println!("HIPPO; s: {:#?}", s);
+// //             let _ = catch_unwind(|| (*recovered_trace_fn)(&s));
+//             // TEMP HACK -- disable catch_unwind for now
+// //             (*recovered_trace_fn)(&s);
+//             recovered_trace_fn.as_ref().unwrap()(&s);
+//             0 // Arbitrary return value -- TODO: Figure out if it should be specified
+//         }
+//
+//         let c = self.db.borrow_mut();
+//         match trace_fn {
+//             Some(f) => unsafe {
+// //                 println!("OSTRICH1");
+//                 ffi::sqlite3_trace_v2(c.db(), ffi::SQLITE_TRACE_STMT as u32, Some(trace_callback), f as *const _ as *mut c_void);
+//             },
+//             None => unsafe {
+// //                 println!("OSTRICH2");
+//                 ffi::sqlite3_trace_v2(c.db(), 0, None, ptr::null_mut());
+//             },
+//         }
+//     }
 
     /// `feature = "trace"` Register or clear a callback function that can be
     /// used for profiling the execution of SQL statements.
